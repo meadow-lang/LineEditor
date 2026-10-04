@@ -26,6 +26,10 @@
 --                       text and the cursor that may do anything -- show a
 --                       picker, say -- and answers what becomes of them
 --
+-- Any of them may do more than answer: an `Editor e`'s functions perform
+-- `e` -- asking a compiler's database what completes a name, say -- and
+-- reading an entry with it performs that too.
+--
 -- **Keys.** Left, Right, Home, End, and Ctrl-A, Ctrl-E, Ctrl-B; Ctrl-Left and
 -- Ctrl-Right, or Alt-B and Alt-F, by words. Backspace, Delete; Ctrl-W the
 -- word before, Ctrl-K the rest of the line, Ctrl-U its start. Up and Down
@@ -65,19 +69,21 @@ use UnicodeWidth as W
 
 use Bound.*
 
--- How an entry is read: see above.
-@pub record Editor = {
+-- How an entry is read: see above. `e` is what its functions may do besides
+-- answer -- ask a compiler's database, say -- and reading an entry with it
+-- does that too.
+@pub record Editor e = {
   @pub prompt : String,
   @pub continued : String,
-  @pub highlight : String -> String,
-  @pub complete : String -> Int -> (Int, [String]),
-  @pub finished : String -> Bool,
-  @pub indent : String -> String,
-  @pub bindings : [(Key, String -> Int -> Bound ! { Console })],
+  @pub highlight : String -> String ! e,
+  @pub complete : String -> Int -> (Int, [String]) ! e,
+  @pub finished : String -> Bool ! e,
+  @pub indent : String -> String ! e,
+  @pub bindings : [(Key, String -> Int -> Bound ! e)],
 }
 
 -- An editor that asks nothing of the text: every Enter enters it.
-@pub def editor : Editor =
+@pub def editor =
   Editor {
     prompt = "> ",
     continued = "  ",
@@ -160,7 +166,7 @@ fun moved (st : State) (at : Int) : State = edited st (charsOf st) at
 
 -- A new line after the cursor's place, opening with what `indent` says of
 -- the text before it.
-fun broken (e : Editor) (st : State) : State =
+fun broken (e : Editor r) (st : State) : State ! r =
   let before = S.fromChars (V.take (charsOf st) (cursorOf st)) in
   inserted st ("\n" ++ e.indent before)
 
@@ -198,7 +204,7 @@ fun commonPrefix (xs : [String]) : String =
       let rec longest n = if n < V.len cs and agrees (n + 1) then longest (n + 1) else n in
       S.fromChars (V.take cs (longest 0))
 
-fun completed (e : Editor) (st : State) : State =
+fun completed (e : Editor r) (st : State) : State ! r =
   let at = cursorOf st in
   match e.complete (textOf st) at with
   | (from, ways) ->
@@ -209,7 +215,7 @@ fun completed (e : Editor) (st : State) : State =
 -- --- a key -------------------------------------------------------------------
 
 -- What `key` makes of the entry.
-@pub fun press (e : Editor) (st : State) (key : Key) : (State, Signal) =
+@pub fun press (e : Editor r) (st : State) (key : Key) : (State, Signal) ! r =
   let cs = charsOf st in
   let at = cursorOf st in
   let on = \s -> (s, GoOn) in
@@ -252,7 +258,7 @@ fun completed (e : Editor) (st : State) : State =
 -- `above` rows below the entry's first: what to write, and how many rows
 -- below the first the cursor is now. Everything from the entry's first row
 -- down is written again; the lines above it are not touched.
-@pub fun drawn (e : Editor) (st : State) (cols : Int) (above : Int) : (String, Int) =
+@pub fun drawn (e : Editor r) (st : State) (cols : Int) (above : Int) : (String, Int) ! r =
   let cs = charsOf st in
   let at = cursorOf st in
   let wide = max 1 cols in
@@ -277,14 +283,14 @@ fun completed (e : Editor) (st : State) : State =
 
 -- An entry, read after `history`: typed and edited at a terminal, or read a
 -- line at a time where there is none.
-@pub fun readEntry (e : Editor) (history : [String]) : Outcome ! { Console | r } =
+@pub fun readEntry (e : Editor r) (history : [String]) : Outcome ! r =
   if T.enterRaw () then
     (let out = editing e (start history) 0 in
       let u = T.leaveRaw () in
       out)
   else plainly e ""
 
-fun editing (e : Editor) (st : State) (above : Int) : Outcome ! { Console | r } =
+fun editing (e : Editor r) (st : State) (above : Int) : Outcome ! r =
   let cols = fst (T.size ()) in
   match drawn e st (if cols > 0 then cols else 80) above with
   | (text, row) ->
@@ -309,13 +315,13 @@ fun editing (e : Editor) (st : State) (above : Int) : Outcome ! { Console | r } 
                 | (st2, NoMore) -> (let w = finish e st2 row in Ended)))
 
 -- The entry left as it stands, the cursor on a new line under it.
-fun finish (e : Editor) (st : State) (above : Int) : () ! { Console | r } =
+fun finish (e : Editor r) (st : State) (above : Int) : () ! r =
   let cols = fst (T.size ()) in
   let done = moved st (V.len (charsOf st)) in
   writeOutput (fst (drawn e done (if cols > 0 then cols else 80) above) ++ "\n\r")
 
 -- With no terminal: lines as they come, until the text is finished.
-fun plainly (e : Editor) (so : String) : Outcome ! { Console | r } =
+fun plainly (e : Editor r) (so : String) : Outcome ! r =
   match readLine () with
   | None -> if S.isEmpty so then Ended else Entered so
   | Just line ->
@@ -358,11 +364,11 @@ use Std.Console (withOutput, withInput)
 fun typed (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c))) (S.chars text)
 
 -- The state after `keys`, and the last thing a key signalled.
-fun after (e : Editor) (history : [String]) (keys : [Key]) : (String, Int, Signal) =
+fun after e (history : [String]) (keys : [Key]) =
   match V.foldl (\acc k -> press e (fst acc) k) (start history, GoOn) keys with
   | (st, sig) -> (textOf st, cursorOf st, sig)
 
-fun plainKeys (keys : [Key]) : (String, Int, Signal) = after editor [] keys
+fun plainKeys (keys : [Key]) = after editor [] keys
 
 @test fun whatIsTypedGoesWhereTheCursorIs () =
   let a = assertEq (plainKeys (typed "abc")) ("abc", 3, GoOn) "at the end" in

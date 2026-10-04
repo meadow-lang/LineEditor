@@ -36,6 +36,10 @@ An `Editor` is a record of what the program has to say about the text:
 
 `editor` is one that asks nothing of the text; start from it.
 
+Any of these functions may do more than answer -- ask a compiler's database
+what completes a name, say: an `Editor e`'s functions perform `e`, and reading
+an entry with it performs that too.
+
 **Keys.** Left, Right, Home, End, Ctrl-A, Ctrl-E, Ctrl-B; Ctrl-Left and
 Ctrl-Right, or Alt-B and Alt-F, by words. Backspace, Delete; Ctrl-W the word
 before, Ctrl-K the rest of the line, Ctrl-U its start. Up and Down move
