@@ -1,0 +1,435 @@
+-- lineEditor: reading an entry from someone typing it.
+--
+--   use LineEditor (editor, readEntry, Outcome)
+--
+--   fun repl history =
+--     match readEntry { editor | prompt = "> " } history with
+--     | Outcome.Entered text -> (let _ = println (eval text) in repl (V.pushBack history text))
+--     | Outcome.Interrupted -> repl history
+--     | Outcome.Ended -> ()
+--
+-- What a prompt is, where `Console.readLine` is not enough: the cursor moved
+-- about in what has been typed, an entry of several lines, the entries before
+-- it brought back, and what the program reading it has to say about the text
+-- -- its colours, what would complete it, whether it is finished, how far in
+-- its next line starts. Those are functions an `Editor` holds:
+--
+--   prompt, continued   what the first line starts with, and each after it
+--   highlight           the text as it is to be shown: the same characters,
+--                       with styles among them
+--   complete            the text and where the cursor is -> where what is
+--                       being completed starts, and what it could be
+--   finished            whether Enter enters the text, or goes on to a new
+--                       line of it
+--   indent              what a new line after the text so far opens with
+--   bindings            keys of the program's own, each a function of the
+--                       text and the cursor that may do anything -- show a
+--                       picker, say -- and answers what becomes of them
+--
+-- **Keys.** Left, Right, Home, End, and Ctrl-A, Ctrl-E, Ctrl-B; Ctrl-Left and
+-- Ctrl-Right, or Alt-B and Alt-F, by words. Backspace, Delete; Ctrl-W the
+-- word before, Ctrl-K the rest of the line, Ctrl-U its start. Up and Down
+-- move between the lines of an entry, and past its first or last to the
+-- entry before or after in the history, as do Ctrl-P and Ctrl-N. Tab
+-- completes: all of it when there is one way, as far as every way agrees
+-- when there are several. Enter enters a finished text and otherwise starts
+-- a new line, indented; Alt-Enter and Ctrl-J start one whatever the text.
+-- Ctrl-C gives the entry up (`Interrupted`); Ctrl-D on an empty one, or the
+-- input closing, is `Ended`. Text pasted goes in as it is, its lines lines.
+--
+-- **Without a terminal** -- input from a file or a pipe -- there is nothing
+-- to edit: lines are read as they come, as many as it takes for `finished`
+-- to say so, and nothing is drawn.
+--
+-- The editor is a state and a function of a key -- `press`, which a test
+-- drives -- and `readEntry` is the loop that gives it a terminal
+-- (`Std.Terminal`): it draws the entry after each key, the lines above it
+-- untouched.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Console (Console, writeOutput, readLine)
+use Std.Terminal as T
+use Std.Terminal (Key, Code, Event)
+use Std.Terminal.Code.*
+use Std.Fs (Fs, readToString, appendString, exists)
+use Std.Result.Result.*
+use UnicodeWidth as W
+
+-- What a key of the program's own makes of the text and the cursor: nothing;
+-- other text, the cursor at a character of it; or the entry, entered.
+@pub data Bound = Kept | Edited String Int | Entering
+
+use Bound.*
+
+-- How an entry is read: see above.
+@pub record Editor = {
+  @pub prompt : String,
+  @pub continued : String,
+  @pub highlight : String -> String,
+  @pub complete : String -> Int -> (Int, [String]),
+  @pub finished : String -> Bool,
+  @pub indent : String -> String,
+  @pub bindings : [(Key, String -> Int -> Bound ! { Console })],
+}
+
+-- An editor that asks nothing of the text: every Enter enters it.
+@pub def editor : Editor =
+  Editor {
+    prompt = "> ",
+    continued = "  ",
+    highlight = \t -> t,
+    complete = \t at -> (at, []),
+    finished = \t -> True,
+    indent = \t -> "",
+    bindings = [],
+  }
+
+-- How reading an entry ended: with the entry; given up, with Ctrl-C; or with
+-- no more to read.
+@derive(Debug, PartialEq)
+@pub data Outcome = Entered String | Interrupted | Ended
+
+use Outcome.*
+
+-- --- the state ---------------------------------------------------------------
+
+-- What has been typed, where the cursor is in it -- before which character
+-- -- the entries before, which of them is shown -- none, when it is past the
+-- last -- and what was being typed when the first of them was gone back to.
+@pub data State = State [Char] Int [String] Int String
+
+-- Nothing typed yet, after `history`.
+@pub fun start (history : [String]) : State = State [] 0 history (V.len history) ""
+
+@pub fun textOf (st : State) : String = match st with | State cs _ _ _ _ -> S.fromChars cs
+
+@pub fun cursorOf (st : State) : Int = match st with | State _ at _ _ _ -> at
+
+fun charsOf st = match st with | State cs _ _ _ _ -> cs
+
+fun edited (st : State) (cs : [Char]) (at : Int) : State = match st with | State _ _ h i stash -> State cs (max 0 (min (V.len cs) at)) h i stash
+
+-- What a key did: the entry goes on, is entered, is given up, or there is
+-- no more; or the screen is to be cleared.
+@derive(Debug, PartialEq)
+@pub data Signal = GoOn | Submit | GiveUp | NoMore | Clear
+
+use Signal.*
+
+def newline : Char = C.fromCode 10
+
+fun isNewline (c : Char) : Bool = C.code c == 10
+
+-- Where the line the cursor is on starts, and ends.
+fun lineStart (cs : [Char]) (at : Int) : Int =
+  if at <= 0 then 0 else if isNewline (V.getOr newline cs (at - 1)) then at else lineStart cs (at - 1)
+
+fun lineEnd (cs : [Char]) (at : Int) : Int =
+  if at >= V.len cs then V.len cs else if isNewline (V.getOr newline cs at) then at else lineEnd cs (at + 1)
+
+fun isWordChar (c : Char) : Bool = C.isAlphaNum c or C.code c == 95 or C.code c >= 128
+
+-- Where the word before the cursor starts: back over what is not a word,
+-- then over the word.
+fun wordLeft (cs : [Char]) (at : Int) : Int =
+  let rec skip i = if i > 0 and not (isWordChar (V.getOr newline cs (i - 1))) then skip (i - 1) else i in
+  let rec word i = if i > 0 and isWordChar (V.getOr newline cs (i - 1)) then word (i - 1) else i in
+  word (skip at)
+
+fun wordRight (cs : [Char]) (at : Int) : Int =
+  let n = V.len cs in
+  let rec skip i = if i < n and not (isWordChar (V.getOr newline cs i)) then skip (i + 1) else i in
+  let rec word i = if i < n and isWordChar (V.getOr newline cs i) then word (i + 1) else i in
+  word (skip at)
+
+fun inserted (st : State) (text : String) : State =
+  let cs = charsOf st in
+  let at = cursorOf st in
+  let new = S.chars text in
+  edited st (V.concat [V.take cs at, new, V.drop cs at]) (at + V.len new)
+
+fun removed (st : State) (from : Int) (to : Int) : State =
+  let cs = charsOf st in
+  if from >= to then st else edited st (V.append (V.take cs from) (V.drop cs to)) from
+
+fun moved (st : State) (at : Int) : State = edited st (charsOf st) at
+
+-- A new line after the cursor's place, opening with what `indent` says of
+-- the text before it.
+fun broken (e : Editor) (st : State) : State =
+  let before = S.fromChars (V.take (charsOf st) (cursorOf st)) in
+  inserted st ("\n" ++ e.indent before)
+
+-- The entry `by` before or after the one shown, if there is one: what was
+-- being typed is kept for coming back to.
+fun recalled (st : State) (by : Int) : State =
+  match st with
+  | State cs at h i stash ->
+      let j = i + by in
+      if j < 0 or j > V.len h then st
+      else
+        let kept = if i == V.len h then S.fromChars cs else stash in
+        let shown = S.chars (if j == V.len h then kept else V.getOr "" h j) in
+        State shown (V.len shown) h j kept
+
+-- The cursor a line up or down, in the column it is in or the line's end.
+fun vertical (st : State) (by : Int) : Maybe State =
+  let cs = charsOf st in
+  let at = cursorOf st in
+  let from = lineStart cs at in
+  let col = at - from in
+  if by < 0 then
+    (if from == 0 then None else (let prev = lineStart cs (from - 1) in Just (moved st (min (prev + col) (from - 1)))))
+  else
+    let stop = lineEnd cs at in
+    if stop >= V.len cs then None else (let next = stop + 1 in Just (moved st (min (next + col) (lineEnd cs next))))
+
+-- What the candidates all start with.
+fun commonPrefix (xs : [String]) : String =
+  match V.get xs 0 with
+  | None -> ""
+  | Just first ->
+      let cs = S.chars first in
+      let agrees = \n -> V.all (\x -> V.take (S.chars x) n == V.take cs n) xs in
+      let rec longest n = if n < V.len cs and agrees (n + 1) then longest (n + 1) else n in
+      S.fromChars (V.take cs (longest 0))
+
+fun completed (e : Editor) (st : State) : State =
+  let at = cursorOf st in
+  match e.complete (textOf st) at with
+  | (from, ways) ->
+      let filled = commonPrefix ways in
+      if V.isEmpty ways or from > at or S.charLength filled <= at - from then st
+      else inserted (removed st from at) filled
+
+-- --- a key -------------------------------------------------------------------
+
+-- What `key` makes of the entry.
+@pub fun press (e : Editor) (st : State) (key : Key) : (State, Signal) =
+  let cs = charsOf st in
+  let at = cursorOf st in
+  let on = \s -> (s, GoOn) in
+  match key.code with
+  | Character c ->
+      if key.ctrl then
+        (if c == "a" then on (moved st (lineStart cs at))
+         else if c == "e" then on (moved st (lineEnd cs at))
+         else if c == "b" then on (moved st (at - 1))
+         else if c == "k" then on (removed st at (lineEnd cs at))
+         else if c == "u" then on (removed st (lineStart cs at) at)
+         else if c == "w" then on (removed st (wordLeft cs at) at)
+         else if c == "p" then on (recalled st (0 - 1))
+         else if c == "n" then on (recalled st 1)
+         else if c == "j" then on (broken e st)
+         else if c == "l" then (st, Clear)
+         else if c == "c" then (st, GiveUp)
+         else if c == "d" then (if V.isEmpty cs then (st, NoMore) else on (removed st at (at + 1)))
+         else on st)
+      else if key.alt then
+        (if c == "b" then on (moved st (wordLeft cs at))
+         else if c == "f" then on (moved st (wordRight cs at))
+         else on st)
+      else on (inserted st c)
+  | Code.Enter -> if key.alt or not (e.finished (textOf st)) then on (broken e st) else (moved st (V.len cs), Submit)
+  | Tab -> on (completed e st)
+  | Backspace -> on (removed st (at - 1) at)
+  | Delete -> on (removed st at (at + 1))
+  | Left -> on (moved st (if key.ctrl then wordLeft cs at else at - 1))
+  | Right -> on (moved st (if key.ctrl then wordRight cs at else at + 1))
+  | Home -> on (moved st (lineStart cs at))
+  | End -> on (moved st (lineEnd cs at))
+  | Up -> on (M.unwrapOr (recalled st (0 - 1)) (vertical st (0 - 1)))
+  | Down -> on (M.unwrapOr (recalled st 1) (vertical st 1))
+  | _ -> on st
+
+-- --- drawing -----------------------------------------------------------------
+
+-- The entry as the terminal is to show it, `cols` wide, when the cursor was
+-- `above` rows below the entry's first: what to write, and how many rows
+-- below the first the cursor is now. Everything from the entry's first row
+-- down is written again; the lines above it are not touched.
+@pub fun drawn (e : Editor) (st : State) (cols : Int) (above : Int) : (String, Int) =
+  let cs = charsOf st in
+  let at = cursorOf st in
+  let wide = max 1 cols in
+  let shown = S.split "\n" (e.highlight (textOf st)) in
+  let plain = S.split "\n" (textOf st) in
+  let lead = \i -> if i == 0 then e.prompt else e.continued in
+  -- How many rows of the terminal a line takes: one more for each time it
+  -- runs past the edge.
+  let rowsOf = \i -> (max 0 (W.width (lead i) + W.width (V.getOr "" plain i) - 1)) / wide + 1 in
+  let body = S.join "\n\r" (V.map (\i -> lead i ++ V.getOr "" shown i) (V.range 0 (V.len shown))) in
+  let line = V.len (V.filter isNewline (V.take cs at)) in
+  let before = S.fromChars (V.drop (V.take cs at) (lineStart cs at)) in
+  let col = W.width (lead line) + W.width before in
+  let row = V.foldl (\acc i -> acc + rowsOf i) 0 (V.range 0 line) + col / wide in
+  let total = V.foldl (\acc i -> acc + rowsOf i) 0 (V.range 0 (V.len plain)) in
+  let back = (if above > 0 then "\u{1b}[${show above}A" else "") ++ "\r\u{1b}[J" in
+  let up = total - 1 - row in
+  let place = (if up > 0 then "\u{1b}[${show up}A" else "") ++ "\r" ++ (let c = col - (col / wide) * wide in if c > 0 then "\u{1b}[${show c}C" else "") in
+  (back ++ body ++ place, row)
+
+-- --- reading -----------------------------------------------------------------
+
+-- An entry, read after `history`: typed and edited at a terminal, or read a
+-- line at a time where there is none.
+@pub fun readEntry (e : Editor) (history : [String]) : Outcome ! { Console | r } =
+  if T.enterRaw () then
+    (let out = editing e (start history) 0 in
+      let u = T.leaveRaw () in
+      out)
+  else plainly e ""
+
+fun editing (e : Editor) (st : State) (above : Int) : Outcome ! { Console | r } =
+  let cols = fst (T.size ()) in
+  match drawn e st (if cols > 0 then cols else 80) above with
+  | (text, row) ->
+      let u = writeOutput text in
+      match T.nextEvent () with
+      | Event.Closed -> (let w = finish e st row in Ended)
+      | Event.Resized -> editing e st row
+      | Event.Pasted text2 -> editing e (inserted st text2) row
+      | Event.Pressed key ->
+          (match V.find (\b -> fst b == key) e.bindings with
+           | Just (_, act) ->
+               (match act (textOf st) (cursorOf st) with
+                | Kept -> editing e st row
+                | Edited text2 at -> editing e (edited st (S.chars text2) at) row
+                | Entering -> (let w = finish e st row in Entered (textOf st)))
+           | None ->
+               (match press e st key with
+                | (st2, GoOn) -> editing e st2 row
+                | (st2, Clear) -> (let w = writeOutput "\u{1b}[2J\u{1b}[H" in editing e st2 0)
+                | (st2, Submit) -> (let w = finish e st2 row in Entered (textOf st2))
+                | (st2, GiveUp) -> (let w = finish e st2 row in Interrupted)
+                | (st2, NoMore) -> (let w = finish e st2 row in Ended)))
+
+-- The entry left as it stands, the cursor on a new line under it.
+fun finish (e : Editor) (st : State) (above : Int) : () ! { Console | r } =
+  let cols = fst (T.size ()) in
+  let done = moved st (V.len (charsOf st)) in
+  writeOutput (fst (drawn e done (if cols > 0 then cols else 80) above) ++ "\n\r")
+
+-- With no terminal: lines as they come, until the text is finished.
+fun plainly (e : Editor) (so : String) : Outcome ! { Console | r } =
+  match readLine () with
+  | None -> if S.isEmpty so then Ended else Entered so
+  | Just line ->
+      let text = if S.isEmpty so then line else so ++ "\n" ++ line in
+      if e.finished text then Entered text else plainly e text
+
+-- --- history, kept in a file ---------------------------------------------------
+
+-- The entries a file holds, oldest first: a line each, a line's end inside
+-- an entry written `\n` and a backslash `\\`. None, if there is no such file.
+@pub fun loadHistory (path : String) : [String] ! { Fs | r } =
+  if not (exists path) then []
+  else
+    match readToString path with
+    | Ok text -> V.map unescaped (V.filter (\l -> not (S.isEmpty l)) (S.split "\n" text))
+    | Err _ -> []
+
+-- `entry` added to the file's end.
+@pub fun saveEntry (path : String) (entry : String) : () ! { Fs | r } =
+  if S.isEmpty (S.trim entry) then () else (let u = appendString (path, escaped entry ++ "\n") in ())
+
+fun escaped (s : String) : String =
+  S.join "" (V.map (\c -> if C.code c == 10 then "\\n" else if C.code c == 92 then "\\\\" else C.toString c) (S.chars s))
+
+fun unescaped (s : String) : String =
+  let cs = S.chars s in
+  let step = \acc c ->
+    match acc with
+    | (out, pending) ->
+        if pending then (V.pushBack out (if C.code c == 110 then newline else c), False)
+        else if C.code c == 92 then (out, True)
+        else (V.pushBack out c, False) in
+    S.fromChars (fst (V.foldl step ([], False) cs))
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+use Std.Console (withOutput, withInput)
+
+fun typed (text : String) : [Key] = V.map (\c -> T.key (Character (C.toString c))) (S.chars text)
+
+-- The state after `keys`, and the last thing a key signalled.
+fun after (e : Editor) (history : [String]) (keys : [Key]) : (String, Int, Signal) =
+  match V.foldl (\acc k -> press e (fst acc) k) (start history, GoOn) keys with
+  | (st, sig) -> (textOf st, cursorOf st, sig)
+
+fun plainKeys (keys : [Key]) : (String, Int, Signal) = after editor [] keys
+
+@test fun whatIsTypedGoesWhereTheCursorIs () =
+  let a = assertEq (plainKeys (typed "abc")) ("abc", 3, GoOn) "at the end" in
+  let b = assertEq (plainKeys (V.concat [typed "ac", [T.key Left], typed "b"])) ("abc", 2, GoOn) "and in the middle" in
+  assertEq (plainKeys (V.concat [typed "h\u{e9}", [T.key Backspace], typed "i"])) ("hi", 2, GoOn) "a character at a time, whatever its bytes"
+
+@test fun theCursorMovesByCharactersWordsAndLines () =
+  let keys = \ks -> V.append (typed "foo bar_baz qux") ks in
+  let a = assertEq (plainKeys (keys [T.key Home])) ("foo bar_baz qux", 0, GoOn) "to the start" in
+  let b = assertEq (plainKeys (keys [T.alt (Character "b"), T.alt (Character "b")])) ("foo bar_baz qux", 4, GoOn) "back two words: an underscore is in one" in
+  let c = assertEq (plainKeys (keys [T.ctrl "a", T.alt (Character "f")])) ("foo bar_baz qux", 3, GoOn) "and forward one" in
+  assertEq (plainKeys (keys [T.key Left, T.key Left, T.key End])) ("foo bar_baz qux", 15, GoOn) "and to the end"
+
+@test fun wordsAndLinesAreCutAway () =
+  let a = assertEq (plainKeys (V.append (typed "foo bar") [T.ctrl "w"])) ("foo ", 4, GoOn) "the word before" in
+  let b = assertEq (plainKeys (V.append (typed "foo bar") [T.ctrl "a", T.ctrl "k"])) ("", 0, GoOn) "the rest of the line" in
+  let c = assertEq (plainKeys (V.append (typed "foo bar") [T.key Left, T.ctrl "u"])) ("r", 0, GoOn) "its start" in
+  assertEq (plainKeys (V.append (typed "ab") [T.key Home, T.key Delete])) ("b", 0, GoOn) "and the character under the cursor"
+
+@test fun enterEntersWhatIsFinishedAndGoesOnWithWhatIsNot () =
+  -- An entry is finished when its parentheses are closed; a new line opens
+  -- two spaces in.
+  let e = { editor | finished = \t -> not (S.contains "(" t) or S.contains ")" t, indent = \t -> "  " } in
+  let a = assertEq (after e [] (V.append (typed "(a") [T.key Code.Enter])) ("(a\n  ", 5, GoOn) "a new line, indented" in
+  let b = assertEq (after e [] (V.concat [typed "(a", [T.key Code.Enter], typed "b)", [T.key Code.Enter]])) ("(a\n  b)", 7, Submit) "and entered when closed" in
+  let c = assertEq (after e [] (V.append (typed "x") [T.alt Code.Enter])) ("x\n  ", 4, GoOn) "Alt-Enter goes on whatever it is" in
+  assertEq (after e [] (V.append (typed "x") [T.ctrl "j"])) ("x\n  ", 4, GoOn) "and so does Ctrl-J"
+
+@test fun upAndDownMoveInAnEntryAndThenThroughTheHistory () =
+  let e = { editor | finished = \t -> False } in
+  let two = V.concat [typed "abcd", [T.key Code.Enter], typed "ef"] in
+  let a = assertEq (after e ["old"] (V.append two [T.key Up])) ("abcd\nef", 2, GoOn) "up a line, in the same column" in
+  let b = assertEq (after e ["old"] (V.append two [T.key Up, T.key Up])) ("old", 3, GoOn) "and past the first, the entry before" in
+  let c = assertEq (after e ["old"] (V.append two [T.key Up, T.key Up, T.key Down])) ("abcd\nef", 7, GoOn) "and back to what was being typed" in
+  assertEq (after e ["one", "two"] [T.ctrl "p", T.ctrl "p", T.ctrl "p", T.ctrl "n"]) ("two", 3, GoOn) "no further back than the first"
+
+@test fun tabCompletesAsFarAsEveryWayAgrees () =
+  let names = ["length", "lines", "last"] in
+  let e = { editor | complete = \t at -> (0, V.filter (\n -> S.startsWith (S.take t at) n) names) } in
+  let a = assertEq (after e [] (V.append (typed "le") [T.key Tab])) ("length", 6, GoOn) "one way: all of it" in
+  let b = assertEq (after e [] (V.append (typed "l") [T.key Tab])) ("l", 1, GoOn) "several, agreeing on no more" in
+  assertEq (after e [] (V.append (typed "li") [T.key Tab])) ("lines", 5, GoOn) "and one again"
+
+@test fun anEntryIsGivenUpOrEnded () =
+  let a = assertEq (plainKeys (V.append (typed "ab") [T.ctrl "c"])) ("ab", 2, GiveUp) "Ctrl-C gives it up" in
+  let b = assertEq (plainKeys [T.ctrl "d"]) ("", 0, NoMore) "Ctrl-D on nothing ends" in
+  assertEq (plainKeys (V.append (typed "ab") [T.key Home, T.ctrl "d"])) ("b", 0, GoOn) "and on something deletes"
+
+@test fun theEntryIsDrawnFromItsFirstRowAndTheCursorPutBack () =
+  let st = fst (V.foldl (\acc k -> press { editor | finished = \t -> False } (fst acc) k) (start [], GoOn) (V.concat [typed "ab", [T.key Code.Enter], typed "cd", [T.key Left]])) in
+  let a = assertEq (drawn editor st 80 0) ("\r\u{1b}[J> ab\n\r  cd\r\u{1b}[3C", 1) "both lines, the cursor a row down and three across" in
+  let b = assertEq (fst (drawn editor st 80 1)) "\u{1b}[1A\r\u{1b}[J> ab\n\r  cd\r\u{1b}[3C" "from a row below the first, up to it first" in
+  -- Six columns: `> abcdefgh` is two rows and a cell, and the cursor is on the second.
+  let long = fst (V.foldl (\acc k -> press editor (fst acc) k) (start [], GoOn) (typed "abcdefgh")) in
+  assertEq (snd (drawn editor long 6 0)) 1 "a line past the edge is more rows"
+
+@test fun anEntryIsReadFromKeys () =
+  let keys = V.map (\k -> Event.Pressed k) (V.concat [typed "1 + ", [T.key Backspace, T.key Backspace], typed "* 2", [T.key Code.Enter]]) in
+  let got = withOutput (\() -> T.withEvents keys (\() -> readEntry editor [])) in
+  let a = assertEq (fst got) (Entered "1 * 2") "what was typed, as edited" in
+  let b = assertEq (fst (withOutput (\() -> T.withEvents [] (\() -> readEntry editor [])))) Ended "and no more keys is the end" in
+  assertEq (fst (withOutput (\() -> T.withEvents [Event.Pressed (T.ctrl "c")] (\() -> readEntry editor [])))) Interrupted "Ctrl-C gives it up"
+
+@test fun aKeyOfTheProgramsOwnIsRunWithTheText () =
+  let e = { editor | bindings = [(T.ctrl "f", \t at -> Edited (t ++ "!") (at + 1))] } in
+  let keys = V.map (\k -> Event.Pressed k) (V.concat [typed "hi", [T.ctrl "f", T.key Code.Enter]]) in
+  assertEq (fst (withOutput (\() -> T.withEvents keys (\() -> readEntry e [])))) (Entered "hi!") "what it made of it"
+
+@test fun historyEntriesKeepTheirLines () =
+  assertEq (V.map (\s -> unescaped (escaped s)) ["one", "two\nlines", "a \\ and \\n"]) ["one", "two\nlines", "a \\ and \\n"] "through the file and back"
