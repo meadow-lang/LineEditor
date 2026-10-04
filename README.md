@@ -1,4 +1,4 @@
-# lineEditor
+# LineEditor
 
 Reading an entry from someone typing it, for
 [Meadow](https://github.com/mcdearman/meadow): the prompt of a REPL. The
@@ -55,5 +55,9 @@ giving it keys; `readEntry` is the loop that gives it a terminal
 ## Install
 
 ```sh
-meadow add mcdearman/MeadowLineEditor
+meadow add mcdearman/LineEditor
 ```
+
+## Licence
+
+BSD 3-Clause: see [LICENSE](LICENSE).

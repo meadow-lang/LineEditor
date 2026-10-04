@@ -1,4 +1,4 @@
--- lineEditor: reading an entry from someone typing it.
+-- LineEditor: reading an entry from someone typing it.
 --
 --   use LineEditor (editor, readEntry, Outcome)
 --
