@@ -1,7 +1,7 @@
 # LineEditor
 
 Reading an entry from someone typing it, for
-[Meadow](https://github.com/mcdearman/meadow): the prompt of a REPL. The
+[Meadow](https://github.com/meadow-lang/meadow): the prompt of a REPL. The
 cursor moves about in what has been typed, an entry can be several lines,
 the entries before it come back, and the program reading it says how the
 text is coloured, what completes it, whether it is finished and how far in
@@ -59,7 +59,7 @@ giving it keys; `readEntry` is the loop that gives it a terminal
 ## Install
 
 ```sh
-meadow add mcdearman/LineEditor
+meadow add meadow-lang/LineEditor
 ```
 
 ## Licence
