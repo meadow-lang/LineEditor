@@ -305,6 +305,18 @@ fun completed (e : Editor r) (st : State) : State ! r =
      out)
   else plainly e ""
 
+-- An entry read as `readEntry` reads one, begun with `text` already typed
+-- and the cursor after it: what a program puts on the line for its user to
+-- go on with. Where there is no terminal, `text` is entered if it is
+-- finished, and lines are added to it if it is not.
+@pub fun readEntryFrom (e : Editor r) (history : [String]) (text : String) : Outcome ! r =
+  if T.enterRaw () then
+    (let out = editing e (State (S.chars text) (S.charLength text) history (V.len history) "") 0 in
+     let u = T.leaveRaw () in
+     out)
+  else if not (S.isEmpty text) and e.finished text then Entered text
+  else plainly e text
+
 fun editing (e : Editor r) (st : State) (above : Int) : Outcome ! r =
   let cols = fst (T.size ()) in
   match drawn e st (if cols > 0 then cols else 80) above with
@@ -570,6 +582,23 @@ fun plainKeys (keys : [Key]) = after editor [] keys
              T.withEvents [Event.Pressed (T.ctrl "c")] (\() -> readEntry editor []))))
        Interrupted
        "Ctrl-C gives it up"
+
+@test fun anEntryMayBeginWithTextAlreadyTyped () =
+  let keys =
+    V.map (\k -> Event.Pressed k) (V.concat [[T.key Backspace], typed "3", [T.key Code.Enter]])
+  in
+  let a =
+    assertEq
+      (fst (withOutput (\() -> T.withEvents keys (\() -> readEntryFrom editor [] "1 + 2"))))
+      (Entered "1 + 3")
+      "the text there to begin with, the cursor after it, edited"
+  in assertEq
+       (fst
+          (withOutput (\() ->
+             T.withEvents [Event.Pressed (T.key Code.Enter)] (\() ->
+               readEntryFrom editor [] "ok"))))
+       (Entered "ok")
+       "and entered as it is"
 
 @test fun aKeyOfTheProgramsOwnIsRunWithTheText () =
   let e = { editor | bindings = [(T.ctrl "f", \t at -> Edited (t ++ "!") (at + 1))] } in
